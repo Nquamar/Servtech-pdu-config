@@ -1,0 +1,500 @@
+#!/usr/bin/env python3.6
+# -*- coding: utf-8 -*-
+
+"""
+    Author  : Nurul Quamar
+    Email   : nquamar@akamai.com
+"""
+
+print("This tool is written by *Nurul Quamar*. It can generate and push config for PDUs with 2, 4, 6 PSUs or FireAnt type.")
+print("You need two files in the same directory: hostname.txt and port.txt, with a blank line separating switch and server entries.\n")
+
+
+import sys
+# Remove the old NOCC library path if present
+sys.path = [p for p in sys.path if "nocc/pylib" not in p]
+
+import pexpect
+import ipaddress
+import getpass
+import re
+import time
+import sys
+from io import StringIO
+
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+def clean_ansi(text):
+    text = ANSI_ESCAPE.sub('', text)
+    return text.replace('\r', '')
+
+def calculate_gateway(ip_str, subnet_str):
+    network = ipaddress.IPv4Network("{}/{}".format(ip_str, subnet_str), strict=False)
+    return str(list(network.hosts())[0])
+
+def load_file(filename):
+    with open(filename, "r") as f:
+        return [line.strip() for line in f if line.strip() or line == "\n"]
+
+
+def verify_pdu_dual_unit(child):
+    """
+    Checks if both Primary (A) and Secondary (B) PDUs are detected.
+    Uses the 'show units' or 'list units' command output.
+
+    Returns True if both PDUs exist, otherwise False.
+    """
+
+    print("\n🔍 Checking for Primary + Secondary PDU units...\n")
+
+    # Send command to PDU
+    child.sendline("show units")
+    try:
+        child.expect([r'\$', r'#', r'Switched PDU'], timeout=10)
+    except pexpect.TIMEOUT:
+        print("❌ ERROR: Timeout while waiting for PDU 'show units' response.")
+        return False
+
+    output_raw = child.before
+    output = output_raw.decode(errors="ignore") if isinstance(output_raw, bytes) else output_raw
+
+    print("----- PDU Unit Output Start -----")
+    print(output.strip())
+    print("----- PDU Unit Output End -----\n")
+
+    # Count units
+    found_primary = "Primary" in output or "Primary (A)" in output
+    found_secondary = "Link" in output or "Secondary" in output or "Link1 (B)" in output
+
+    # Evaluate
+    if found_primary and found_secondary:
+        print("✅ Both Primary (A) and Secondary (B) PDUs detected.\nProceeding...\n")
+        return True
+    else:
+        print("❌ Secondary PDU NOT detected!")
+        print("❌ Only Primary unit found. Aborting configuration for safety.\n")
+                return False
+
+def generate_config(pdu_name, ip, dc_abr, dc_id, hostnames, ports, fabric_ver, subnet, psu_count):
+    gateway = calculate_gateway(ip, subnet)
+    print("set dhcp disabled")
+    print("set dhcp staticfallback disabled")
+    print("set ipv4 address {}".format(ip))
+    print("set gateway {}".format(gateway))
+    print("set subnet {}".format(subnet))
+    print("set location {}".format(pdu_name))
+    print("set telnet disabled")
+    print("set ssl enabled\n")
+    print("set ssl usercert enabled")
+    print("set ftp server disabled")
+    print("set syslog port 515")
+    print("set banner\n")
+    print("**IMPORTANT** This is a Pro Series PDU that has 1 master and 1 slave, Outlet groups are set up on here so you can just type reboot hostname to reboot a server or piece of gear.\n")
+    print("create user admin")
+    print("set user access admin admin")
+    print("set snmp v2 enabled\ny")
+    print("set snmp v2 getcomm public")
+    print("set snmp sysname {}".format(pdu_name))
+    print("set snmp syslocation {}".format(pdu_name))
+
+    if fabric_ver == "v2":
+        print("set dns1 10.{}.1.12".format(dc_id))
+        print("set dns2 10.{}.1.13".format(dc_id))
+
+    if "" in ports:
+        split_index = ports.index("")
+        switch_ports = [p for p in ports[:split_index] if p]
+        server_ports = [p for p in ports[split_index + 1:] if p]
+        empty_index = hostnames.index("") if "" in hostnames else len(hostnames)
+        switch_hosts = [h for h in hostnames[:empty_index] if h]
+        server_hosts = [h for h in hostnames[empty_index + 1:] if h]
+    else:
+        switch_ports, server_ports = ports, []
+        switch_hosts, server_hosts = hostnames, []
+
+    port_cmds, group_cmds, delay_cmds = [], [], []
+
+    for host, port in zip(switch_hosts, switch_ports):
+        group_cmds.append("create group {}".format(host))
+        port_cmds.append("set outlet name AA{} {}_PSU1".format(port, host))
+        port_cmds.append("set outlet name BA{} {}_PSU2".format(port, host))
+        group_cmds.append("add outlettogroup AA{} {}".format(port, host))
+        group_cmds.append("add outlettogroup BA{} {}".format(port, host))
+
+    fireant_toggle = True
+    for host in server_hosts:
+        group_cmds.append("create group {}".format(host))
+        if psu_count == 2:
+            port = server_ports.pop(0)
+            port_cmds.append("set outlet name AA{} {}_PSU1".format(port, host))
+            port_cmds.append("set outlet name BA{} {}_PSU2".format(port, host))
+            group_cmds.append("add outlettogroup AA{} {}".format(port, host))
+            group_cmds.append("add outlettogroup BA{} {}".format(port, host))
+        elif psu_count == 4:
+            psu_ports = server_ports[:2]; server_ports = server_ports[2:]
+            port_num = 1
+            for port in psu_ports:
+                port_cmds.append("set outlet name AA{} {}_PSU{}".format(port, host, port_num))
+                group_cmds.append("add outlettogroup AA{} {}".format(port, host))
+                port_num += 2
+            port_num = 2
+            for port in psu_ports:
+                port_cmds.append("set outlet name BA{} {}_PSU{}".format(port, host, port_num))
+                group_cmds.append("add outlettogroup BA{} {}".format(port, host))
+                port_num += 2
+        elif psu_count == 6:
+            psu_ports = server_ports[:3]; server_ports = server_ports[3:]
+            psu_num = 1
+            for port in psu_ports:
+                port_cmds.append("set outlet name AA{} {}_PSU{}".format(port, host, psu_num))
+                group_cmds.append("add outlettogroup AA{} {}".format(port, host))
+                psu_num += 1
+                port_cmds.append("set outlet name BA{} {}_PSU{}".format(port, host, psu_num))
+                group_cmds.append("add outlettogroup BA{} {}".format(port, host))
+                psu_num += 1
+        elif psu_count == "f":
+            psu_ports = server_ports[:6]
+            psu_num_list = [1, 2, 3, 4, 5, 8]
+            for port, psu_num in zip(psu_ports, psu_num_list):
+                if fireant_toggle:
+                    port_cmds.append("set outlet name AA{} {}_PSU{}".format(port, host, psu_num))
+                    group_cmds.append("add outlettogroup AA{} {}".format(port, host))
+                else:
+                    port_cmds.append("set outlet name BA{} {}_PSU{}".format(port, host, psu_num))
+                    group_cmds.append("add outlettogroup BA{} {}".format(port, host))
+            fireant_toggle = not fireant_toggle
+
+    for port in range(1, 37):
+        delay = 0 if port <= 6 else ((port - 1) // 4) * 10
+        delay_cmds.append("set outlet extondelay AA{} {}".format(port, delay))
+        delay_cmds.append("set outlet extondelay BA{} {}".format(port, delay))
+
+    print("\n".join(port_cmds))
+    print("\n".join(group_cmds))
+    print("\n".join(delay_cmds))
+    print("set syslog host1 infra-{}.linode.com".format(dc_abr))
+    print("restart")
+    print("remove user admn")
+
+# Config-push logic local → ZTP → Opengear → PDU
+
+def connect_to_ztp(ztp_host, og_ip, og_pass, pdu_port, commands, default_pass, pdu_pass, og_user="root", pdu_user="admn"):
+    print("[INFO] Connecting to ZTP server {} via gwsh...".format(ztp_host))
+    try:
+        child = pexpect.spawn("gwsh {}".format(ztp_host), encoding="utf-8", timeout=60)
+        child.logfile_read = sys.stdout
+        child.expect(["[#\$>]", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        print("[SUCCESS] Logged into ZTP shell successfully.")
+
+        print("[INFO] Connecting to Opengear {}...".format(og_ip))
+        child.sendline("ssh {}@{}".format(og_user, og_ip))
+        index = child.expect(["yes/no", "[Pp]assword:", "#"], timeout=20)
+
+        if index == 0:
+            child.sendline("yes")
+            child.expect("[Pp]assword:")
+
+        if index in [1, 0]:
+            child.sendline(og_pass)
+            child.expect("#", timeout=15)
+
+        print("[SUCCESS] Logged into Opengear successfully.")
+        child.sendline("pmshell")
+        child.expect("Connect to port >", timeout=10)
+        child.sendline(pdu_port)
+        time.sleep(2)
+        child.sendline("")
+
+        # detect PDU Login
+        print("[INFO] Waiting for PDU connection...")
+
+        last_prompt = None  # track previous match
+
+        try:
+            while True:
+                index = child.expect([
+                    "Username:",
+                    "Password:",
+                    "Switched PDU:",      # actual PDU prompt
+                    pexpect.TIMEOUT,
+                    pexpect.EOF
+                ], timeout=20)
+
+                if index == 0:
+                    if last_prompt == "Username":
+                        # avoid rapid double-send
+                        print("[DEBUG] Duplicate Username prompt ignored (likely echo).")
+                        time.sleep(1)
+                        continue
+                    print("[INFO] Username prompt detected ?~@~T sending credentials...")
+                    child.sendline(pdu_user)
+                    last_prompt = "Username"
+                    continue
+
+                elif index == 1:
+                    print("[INFO] Password prompt detected ?~@~T sending password...")
+                    child.sendline(default_pass)
+                    last_prompt = "Password"
+                    # wait for either success or another username (retry)
+                    sub_index = child.expect([
+                        "Switched PDU:",
+                        "New Password:",
+                        "Verify Password:",
+                        "Access denied",
+                        "Username:",
+                        pexpect.TIMEOUT
+                    ], timeout=15)
+
+                    if sub_index == 0:
+                        print("[INFO] Logged into PDU successfully.")
+                        break
+                    elif sub_index == 1:
+                        print("[WARN] First time login detected, Need do change password...")
+                        child.sendline(pdu_pass)
+                        time.sleep(0.2)
+                        child.sendline(pdu_pass)
+                        last_prompt = "New Password"
+                        continue
+                    elif sub_index == 2:
+                        print("[WARN] First time login detected, Confirming password...")
+                        child.sendline(pdu_pass)
+                        last_prompt = "Verify Password"
+                        continue
+
+
+                    elif sub_index == 3:
+                        print("[WARN] Access denied ?~@~T retrying credentials...")
+                        last_prompt = None
+                        continue
+                    elif sub_index == 4:
+                        print("[WARN] Got Username again after password ?~@~T retrying login...")
+                        last_prompt = None
+                        continue
+                    else:
+                        print("[ERROR] Timeout after sending password.")
+                        continue
+
+                elif index == 2:
+                    print("[INFO] Already in PDU prompt (no login needed).")
+                    break
+
+                elif index == 3:
+                    print("[ERROR] Timeout waiting for PDU login or prompt.")
+                    #print(child.before.decode(errors="ignore"))
+
+                    output = child.before
+                    if isinstance(output, bytes):
+                        output = output.decode(errors="ignore")
+                    print(output)
+
+                    return
+
+                elif index == 4:
+                    print("[ERROR] Connection closed unexpectedly (EOF).")
+                    return
+
+        except pexpect.EOF:
+            print("[ERROR] EOF encountered while waiting for PDU prompt.")
+            return
+        except pexpect.TIMEOUT:
+            print("[ERROR] Timeout while waiting for PDU prompt.")
+            return
+        print("[INFO] Reached PDU session. Applying configuration...")
+
+        #====Verify if both pdu are connected properly===
+        if not verify_pdu_dual_unit(child):
+            print("❌ Aborting script because Secondary PDU is missing.")
+            cleanup(child_og=child)
+            sys.exit(1)
+        #====pushing config to pdu=====
+        for cmd in commands:
+            cmd_clean = cmd.strip().lower()
+            print("[SEND] {}".format(cmd))
+            child.sendline(cmd)
+            time.sleep(0.5)
+
+            if cmd_clean.startswith("set banner"):
+                banner_text = (
+                    "**IMPORTANT** This is a Pro Series PDU that has 1 master and 1 slave, "
+                    "Outlet groups are set up so you can type reboot hostname to reboot a server or gear.\n"
+                )
+                child.sendline(banner_text)
+                child.send("\x1A")
+                child.expect("Switched PDU:", timeout=30)
+
+            elif cmd_clean.startswith("create user"):
+                child.expect(["Enter password:", "Password:"], timeout=10)
+                child.sendline(pdu_pass)
+                child.expect(["Confirm password:", "Verify password"], timeout=10)
+                child.sendline(pdu_pass)
+                child.expect("Switched PDU:", timeout=20)
+
+            elif cmd.strip().lower().startswith("set snmp v2"):
+
+                print("[DEBUG] Sending SNMPv2 enable command and watching for confirmation...")
+                try:
+                        # Wait for either the confirmation prompt or normal prompt
+                        index = child.expect([
+                                r"Do you want to continue\?.*N/o\):",   # confirmation prompt
+                                r"Switched PDU:"                        # normal prompt (no warning)
+                        ], timeout=20)
+
+                        if index == 0:
+                                print("[INFO] Detected SNMPv2 confirmation prompt ?~@~T replying 'yes'")
+                                child.sendline("yes")
+                                # Wait again for normal prompt to confirm completion
+                                child.expect("Switched PDU:", timeout=30)
+                                print("[INFO] SNMPv2 enablement confirmed.")
+                        else:
+                                print("[INFO] No confirmation required, continuing...")
+
+                except pexpect.TIMEOUT:
+                        print("[WARN] Timeout ?~@~T No SNMPv2 prompt detected. Proceeding anyway.")
+                continue
+
+
+            elif cmd.strip().lower().startswith("restart"):
+                print("[DEBUG] Handeling restart...")
+                child.sendline(cmd)
+                child.expect(r"(?i)are you sure you want to restart\?.*:", timeout=10)
+                child.send("yes")
+                child.expect("System Boot Complete", timeout=240)
+                print("[INFO] Sending Enter to get login prompt after boot...")
+                child.sendline("")
+                time.sleep(3)
+                try:
+                        child.expect("Username:", timeout=30)
+                        print("[INFO] PDU ready ?~@~T logging in with new admin credentials.")
+                        child.sendline("admin")
+                        child.expect("Password:", timeout=10)
+                        child.sendline(pdu_pass)
+                        child.expect("Switched PDU:", timeout=30)
+                        print("[INFO] Successfully logged in as 'admin' after reboot.")
+                except pexpect.TIMEOUT:
+                        print("[ERROR] Login prompt did not appear after reboot.")
+                        return
+
+                #  Remove the old user 'admn' and confirming configs
+                print("[INFO] Removing old user 'admn'...")
+                child.sendline("remove user admn")
+                try:
+                        child.expect("Switched PDU:", timeout=20)
+                        print("[INFO] Old user 'admn' removed successfully.")
+                except pexpect.TIMEOUT:
+                        print("[WARN] Could not confirm removal of 'admn' user ?~@~T check manually.")
+
+
+                print("[INFO] Verifying applied configuration...")
+                verify_cmds = [
+                    "list group all",
+                    "list outlets",
+                    "show network"
+                ]
+
+                for cmd in verify_cmds:
+                    print(f"\n[VERIFY] Running: {cmd}")
+                    child.sendline(cmd)
+                    # Give the PDU a moment to produce output
+                    time.sleep(2)
+
+                    try:
+                        # Wait for prompt to reappear (means output finished) 
+                        child.expect("Switched PDU:", timeout=15)
+                        output = child.before
+                        if isinstance(output, bytes):
+                            output = output.decode(errors="ignore")
+
+                        # Remove echoed command if present
+                        lines = output.strip().splitlines()
+                        if lines and lines[0].strip() == cmd:
+                            lines = lines[1:]  # drop the echoed command line
+                        cleaned_output = "\n".join(lines)
+                        print(f"----- Output of '{cmd}' -----")
+                        print(cleaned_output.strip())
+                        print("----- End of output -----\n")
+
+                    except pexpect.TIMEOUT:
+                        print(f"[WARN] Timeout while waiting for output of '{cmd}'")
+                        try:
+                            partial_output = child.read_nonblocking(size=4096, timeout=1)
+                            if isinstance(partial_output, bytes):
+                                partial_output = partial_output.decode(errors="ignore")
+                            print(partial_output.strip())
+                        except Exception:
+                            pass
+            else:
+                # Wait for PDU prompt after normal command
+                child.expect("Switched PDU", timeout=10)
+
+        # --- Logout sequence ---
+        print("[INFO] Logging out from PDU and Opengear...")
+        child.sendline("exit")
+        time.sleep(0.6)
+        child.sendline("%")
+        time.sleep(0.6)
+        child.sendline(".")
+        time.sleep(0.6)
+        child.sendline("exit")
+        time.sleep(0.6)
+        child.close()
+
+
+        print("[SUCCESS] Config pushed successfully to PDU via Opengear {}".format (pdu_port))
+
+    except pexpect.exceptions.TIMEOUT as e:
+        print("[ERROR] Timeout occurred:", e)
+    except pexpect.exceptions.EOF as e:
+        print("[ERROR] Connection closed unexpectedly:", e)
+
+
+
+# ===========================================================
+# MAIN FUNCTION
+# ===========================================================
+
+if __name__ == "__main__":
+    pdu_name = input("Enter PDU name: ").strip()
+    ip = input("Enter PDU IP: ").strip()
+    dc_abr = input("Enter DC abbreviation: ").strip()
+    dc_id = input("Enter DC ID: ").strip()
+
+    while True:
+        fabric_ver = input("Enter fabric version (v2/v3): ").strip().lower()
+        if fabric_ver in ["v2", "v3"]:
+            subnet = "255.255.0.0" if fabric_ver == "v2" else "255.255.255.224"
+            break
+        print("❌ Invalid choice, please enter v2 or v3.")
+
+    while True:
+        psu_in = input("Enter number of PSUs per server (2/4/6/F): ").strip().lower()
+        if psu_in in ("2", "4", "6"):
+            psu_count = int(psu_in)
+            break
+        elif psu_in == "f":
+            psu_count = "f"
+            break
+        print("❌ Please enter 2, 4, 6, or F.")
+
+    hostnames = load_file("hostname.txt")
+    ports = load_file("port.txt")
+
+    buffer = StringIO()
+    sys.stdout = buffer
+    generate_config(pdu_name, ip, dc_abr, dc_id, hostnames, ports, fabric_ver, subnet, psu_count)
+    sys.stdout = sys.__stdout__
+
+    config_text = buffer.getvalue()
+    print(config_text)
+    commands = [line for line in config_text.splitlines() if line.strip() and not line.startswith("#")]
+
+    choice = input("\nDo you want to push config via ZTP (local → ZTP → OG → PDU)? (y/n): ").strip().lower()
+    if choice == "y":
+        ztp_host = input("Enter ZTP Server IP or hostname: ").strip()
+        og_ip = input("Enter Opengear IP: ").strip()
+        #og_user = input("Enter Opengear Username: ").strip()
+        og_pass = getpass.getpass("Enter Opengear Password: ")
+        pdu_port = input("Enter OG port where PDU is connected : ")
+        default_pass = getpass.getpass("Enter PDU admn Password: ")
+        pdu_pass = getpass.getpass("Enter new PDU password: ")
+
+        connect_to_ztp(ztp_host, og_ip, og_pass, pdu_port, commands, default_pass, pdu_pass)                        
